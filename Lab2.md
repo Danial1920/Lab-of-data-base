@@ -4,15 +4,19 @@ WITH FlightDistances AS (
     SELECT
         f.flight_id,
         f.aircraft_code,
-        (
-            6371 * acos(
-                cos(radians(dep.coordinates[1])) 
-                * cos(radians(arr.coordinates[1])) 
-                * cos(radians(arr.coordinates[0]) - radians(dep.coordinates[0]))
-                + sin(radians(dep.coordinates[1]))
-                * sin(radians(arr.coordinates[1])) 
-            )
-        ) AS distance_km
+        CASE 
+            WHEN dep.coordinates IS NOT NULL AND arr.coordinates IS NOT NULL THEN
+                6371 * acos(
+                    GREATEST(-1, LEAST(1, 
+                        cos(radians((dep.coordinates::point)[1])) 
+                        * cos(radians((arr.coordinates::point)[1])) 
+                        * cos(radians((arr.coordinates::point)[0]) - radians((dep.coordinates::point)[0]))
+                        + sin(radians((dep.coordinates::point)[1]))
+                        * sin(radians((arr.coordinates::point)[1]))
+                    ))
+                )
+            ELSE NULL
+        END AS distance_km
     FROM flights f
     JOIN airports_data dep ON f.departure_airport = dep.airport_code
     JOIN airports_data arr ON f.arrival_airport = arr.airport_code
@@ -20,35 +24,97 @@ WITH FlightDistances AS (
 ),
 PricePerKm AS (
     SELECT 
-        ad.model->>'ru' AS "Модель самолета",
+        COALESCE(ad.model->>'ru', ad.model->>'en', ad.model::text) AS "Модель самолета",
         tf.fare_conditions AS "Класс",
         fd.distance_km,
         tf.amount,
         CASE 
             WHEN fd.distance_km > 0 THEN tf.amount / fd.distance_km 
-            ELSE 0 
+            ELSE NULL 
         END AS price_per_km
     FROM ticket_flights tf
     JOIN FlightDistances fd ON tf.flight_id = fd.flight_id
     JOIN aircrafts_data ad ON fd.aircraft_code = ad.aircraft_code
-    WHERE tf.amount > 0 AND fd.distance_km > 100
+    WHERE tf.amount > 0 AND fd.distance_km > 100  
+),
+AggregatedData AS (
+    SELECT
+        "Модель самолета",
+        "Класс",
+        COUNT(*) AS "Кол-во билетов",
+        ROUND(AVG(price_per_km)::numeric, 2) AS "Средняя цена за 1 км (для пасс.), руб.",
+        ROUND((SUM(amount) / SUM(distance_km))::numeric, 2) AS "Выручка за 1 км (для а/к), руб.",
+        COUNT(*) * AVG(price_per_km) AS estimated_total_revenue
+    FROM PricePerKm
+    WHERE price_per_km IS NOT NULL
+    GROUP BY "Модель самолета", "Класс"
+),
+RankedData AS (
+    SELECT *,
+        RANK() OVER (
+            PARTITION BY "Класс" 
+            ORDER BY "Средняя цена за 1 км (для пасс.), руб." ASC
+        ) AS passenger_rank,
+        RANK() OVER (
+            PARTITION BY "Класс" 
+            ORDER BY "Выручка за 1 км (для а/к), руб." DESC
+        ) AS airline_rank
+    FROM AggregatedData
 )
 SELECT
     "Модель самолета",
     "Класс",
-    COUNT(*) AS "Кол-во билетов (выборка)",
-    ROUND(AVG(price_per_km), 2) AS "Средняя цена за 1 км (для пасс.), руб.",
-    ROUND(SUM(amount) / SUM(distance_km), 2) AS "Выручка за 1 км (для а/к), руб."
-FROM PricePerKm
-GROUP BY "Модель самолета", "Класс"
+    "Кол-во билетов",
+    "Средняя цена за 1 км (для пасс.), руб.",
+    "Выручка за 1 км (для а/к), руб.",
+    CASE 
+        WHEN passenger_rank = 1 THEN 'ЛУЧШИЙ ДЛЯ ПАССАЖИРА'
+        ELSE '#' || passenger_rank::text
+    END AS "Рейтинг для пассажира",
+    CASE 
+        WHEN airline_rank = 1 THEN 'ЛУЧШИЙ ДЛЯ АВИАКОМПАНИИ'
+        ELSE '#' || airline_rank::text
+    END AS "Рейтинг для а/к"
+FROM RankedData
+WHERE "Кол-во билетов" >= 10  -- Мин. выборка для стат. знач
 ORDER BY 
-    "Класс", 
-    "Средняя цена за 1 км (для пасс.), руб." ASC;
+    "Класс",
+    "Средняя цена за 1 км (для пасс.), руб." ASC,
+    "Выручка за 1 км (для а/к), руб." DESC;
 ```
+
 ## Комментарии:
-Этот блок анализирует выгоду для пассажиров и авиакомпании:
-1.  Расчет Расстояния: Сначала рассчитываю расстояние (`distance_km`) для каждого рейса по ф.Гаверсинуса. Формула использует координаты (широту и долготу) аэропортов вылета и прилета.
-2.  CTE `PricePerKm`: Соединяю таблицы ticket_flights (где есть цена билета amount`) с таблицей `FlightDistances (где есть расстояние `distance_km`). Рассчитываю стоимость одного километра полета (`price_per_km`) для каждого отдельного билета.
-3.  Агрегация:
-    * Выгода для Пассажира: AVG(price_per_km) — показывает среднюю цену за 1 км.
-    * Выгода для Авиакомпании: SUM(amount) / SUM(distance_km) — показывает общую выручку с 1 км полета этого борта.
+### 1. FlightDistances 
+* Для точного расчета использую ф.Гаверсинуса
+* Функция GREATEST/LEAST для защиты от ошибок округления при расчете acos
+
+---
+
+### 2. PricePerKm 
+* Рассчитана индивид. стоимость 1 км (`tf.amount / fd.distance_km`) для каждого билета.
+* Фильтруем с помощтю "WHERE tf.amount > 0 AND fd.distance_km > 100" (исключаю  короткие рейсы повышая точность)
+* (`COALESCE(model->>'ru', ...)`) - вывод модели на русском яз
+
+---
+
+### 3. AggregatedData 
+* Группирую По "модель самолета" и "класс"
+* AVG(price_per_km) — Средняя цена за 1 км
+* SUM(amount) / SUM(distance_km) — Выручка за 1 км
+* Для корректного округления приведены к ::numeric
+
+---
+
+### 4. RankedData
+* Использую оконную ф-ию RANK() OVER.
+* Присваиваю ранги ТОЛЬКО внутри кажд класса (`PARTITION BY "Класс"`).
+* Логика работы:
+    * passenger_rank: Сортировка по цене ASC (наим цена = ранг №1).
+    * airline_rank: Сортировка по выручке DESC (наиб выручка = ранг №1).
+
+---
+
+### 5. Финальный SELECT 
+* Оставляю онли стат значимые комбинации (`WHERE "Кол-во билетов" >= 10`).
+* Использование CASE для маркировки лучших вариантов (`ЛУЧШИЙ ДЛЯ...`) на основе рангов
+* Упоряд. по классу и затем по экономичности для пассажира.
